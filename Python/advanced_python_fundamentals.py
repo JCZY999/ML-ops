@@ -3,19 +3,25 @@
 Use these tools to write pipelines that are readable, memory-efficient,
 reusable, and easy to instrument. Run this file to see each example.
 
-Requires Python 3.10+; all examples use only the standard library.
+Requires Python 3.10+. Core demos use the standard library. Optional API demo:
+    python -m pip install 'pydantic>=2,<3' 'fastapi>=0.115,<1' uvicorn
+    python advanced_python_fundamentals.py --pydantic
+    python -m uvicorn advanced_python_fundamentals:create_app --factory
+Run the uvicorn command from this file's directory, then visit /docs.
 """
 
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict, deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache, partial, reduce, wraps
 from itertools import chain, combinations, islice
 from math import isfinite
 from time import perf_counter
-from typing import Protocol
+import os
+import sys
+from typing import Annotated, Generic, Literal, Optional, Protocol, TypeVar, TypedDict, Union
 
 
 # Comprehensions: transform/filter records compactly.
@@ -313,6 +319,222 @@ def demo_object_oriented_python() -> None:
 #   deterministic and exercise invalid inputs and collaborator failures as well.
 
 
+# Typing and clean application design
+# typing describes contracts for editors/type checkers; Python does not enforce
+# annotations by itself. Prefer precise types over Any (which disables checks).
+# object means an unknown value that must be narrowed before using it.
+# References: https://docs.python.org/3/library/typing.html
+# https://docs.pydantic.dev/latest/concepts/fields/
+# https://fastapi.tiangolo.com/tutorial/dependencies/
+
+
+# Optional[T] means T | None, NOT 'the argument can be omitted'. A default makes
+# an argument omittable. Union[A, B] means A | B; narrow it with isinstance.
+def normalize_run_id(value: Union[str, int]) -> str:
+    """Pure function: same input/output, no I/O, no mutation of caller data."""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise TypeError("run_id must be a string or integer, excluding bool")
+    normalized = str(value).strip()
+    if not normalized:
+        raise ValueError("run_id must not be empty")
+    return normalized
+
+
+def find_run_index(run_ids: Sequence[str], target: str) -> Optional[int]:
+    """Return None for absence; zero is a valid index, so don't test truthiness."""
+    for index, run_id in enumerate(run_ids):
+        if run_id == target:
+            return index
+    return None
+
+
+# Literal narrows values, not just types. Runtime callers still need validation.
+RunStage = Literal["train", "evaluate", "serve"]
+
+
+class RunSummary(TypedDict):
+    """A plain dictionary's static shape; this creates no runtime validator."""
+    run_id: str
+    stage: RunStage
+    score: Optional[float]  # Required key whose VALUE may be None.
+
+
+def summarize_run(run_id: Union[str, int], stage: RunStage) -> RunSummary:
+    if stage not in ("train", "evaluate", "serve"):
+        raise ValueError("Unsupported run stage")
+    return {"run_id": normalize_run_id(run_id), "stage": stage, "score": None}
+
+
+# Generics preserve relationships between input/output types. T is a placeholder,
+# unlike Any. Page[Prediction] and Page[RunSummary] share code but retain item types.
+# TypeVar/Generic syntax works on Python 3.10; class Page[T] requires Python 3.12+.
+T = TypeVar("T")
+
+
+@dataclass(frozen=True, slots=True)
+class Page(Generic[T]):
+    items: tuple[T, ...]
+
+    def first(self) -> Optional[T]:
+        return self.items[0] if self.items else None
+
+
+# Protocol again, at the application boundary: HTTP code needs only predict().
+# An implementation can satisfy this interface without inheriting this class.
+class Predictor(Protocol):
+    def predict(self, features: tuple[float, ...]) -> Prediction:
+        ...
+
+
+def load_model_config(environ: Mapping[str, str]) -> ModelConfig:
+    """Read an explicit environment snapshot; validate before serving requests."""
+    # Environment variables are strings: parsing is deliberate, unlike arbitrary
+    # coercion of request JSON. Passing a mapping makes tests independent of os.
+    raw_threshold = environ.get("ML_THRESHOLD", "0.7")
+    try:
+        threshold = float(raw_threshold)
+    except ValueError as exc:
+        raise ValueError("ML_THRESHOLD must be a number between 0 and 1") from exc
+    return ModelConfig(environ.get("ML_MODEL_NAME", "mean-v1"), threshold)
+
+
+# Configuration management: defaults < explicit environment values here. Load
+# once at application creation, fail early, and inject validated configuration.
+# Do not scatter os.getenv calls through business logic or commit secrets.
+# Larger apps can use pydantic_settings.BaseSettings (a separate package in v2)
+# for typed environment/.env/secrets sources; document precedence and never log
+# the full settings object when it contains credentials.
+
+
+def build_api_models():
+    """Return Pydantic v2 schemas; defer optional imports for the core demo."""
+    from pydantic import BaseModel, ConfigDict, Field
+
+    # Annotated adds metadata; Pydantic interprets Field constraints at runtime.
+    # DRY: define the probability contract once for both request and response.
+    Probability = Annotated[
+        float, Field(strict=True, ge=0.0, le=1.0, allow_inf_nan=False)
+    ]
+
+    class PredictRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        features: list[Probability] = Field(min_length=1, max_length=1024)
+        # Nullable AND omittable because it has a default. In Pydantic v2,
+        # Optional[str] without '= None' would be required but accept null.
+        request_id: Optional[str] = Field(default=None, max_length=100, strict=True)
+
+    class PredictResponse(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+        model_name: str
+        score: Probability
+        label: bool
+        request_id: Optional[str] = None
+
+    return PredictRequest, PredictResponse
+
+
+def demo_pydantic() -> None:
+    """Validate untrusted data, then serialize the validated model."""
+    from pydantic import ValidationError
+
+    request_model, _ = build_api_models()
+    request = request_model.model_validate({"features": [0.8, 0.9]})
+    print("Pydantic validated data:", request.model_dump())
+    print("Pydantic JSON:", request.model_dump_json())
+    try:
+        request_model.model_validate({"features": ["0.8"], "typo": True})
+    except ValidationError as exc:
+        # Show just locations/types; raw validation errors may contain user data.
+        print("Rejected fields:", [(error["loc"], error["type"]) for error in exc.errors()])
+
+
+def create_app(service_factory: Optional[Callable[[], Predictor]] = None):
+    """Build the optional FastAPI app; callers can inject a test service factory."""
+    from fastapi import Depends, FastAPI, HTTPException
+
+    request_model, response_model = build_api_models()
+    app = FastAPI(title="Typed prediction example")
+
+    if service_factory is None:
+        config = load_model_config(dict(os.environ))
+        model = MeanProbabilityModel(config)
+
+        def default_service_factory() -> Predictor:
+            # Per-request demo sink avoids unbounded shared in-memory history.
+            # It is intentionally ephemeral; inject a durable adapter in real use.
+            return PredictionService(config, model, InMemoryPredictionSink())
+
+        service_factory = default_service_factory
+
+    # Separate concerns: schemas validate HTTP data; the service runs business
+    # logic; the route maps inputs/outputs. Domain code imports no FastAPI classes.
+    # Use def for this synchronous service. Blocking work in async def blocks the
+    # event loop; heavy inference usually needs a dedicated execution strategy.
+    @app.post("/predict", response_model=response_model)
+    def predict_route(
+        payload: request_model,
+        service: Annotated[Predictor, Depends(service_factory)],
+    ):
+        try:
+            result = service.predict(tuple(payload.features))
+        except OSError as exc:
+            # Translate this known infrastructure failure, not every exception.
+            # Invalid server/model output should remain a server error, not 422.
+            raise HTTPException(status_code=503, detail="Prediction storage unavailable") from exc
+        return response_model(
+            model_name=result.model_name,
+            score=result.score,
+            label=result.label,
+            request_id=payload.request_id,
+        )
+
+    # POST /predict {"features": [0.8, 0.9]} -> 200 with score ~0.85.
+    # Empty/out-of-range/string features or unknown keys -> 422 before service use.
+    # FastAPI derives OpenAPI docs and validates responses using these schemas.
+    return app
+
+
+def demo_typing() -> None:
+    summary = summarize_run(42, "evaluate")
+    page: Page[RunSummary] = Page((summary,))
+    index = find_run_index(["42", "43"], "42")
+    print("\nTyping / Union / Literal / TypedDict:", summary)
+    print("Optional (zero is present):", index if index is not None else "missing")
+    print("Generics preserve the item type:", page.first())
+    print("Validated configuration:", load_model_config({"ML_THRESHOLD": "0.8"}))
+
+
+# Clean functions: one clear job, explicit parameters/return values, descriptive
+# names, predictable errors, no hidden I/O or mutation (see normalize_run_id).
+# Separation of concerns: parsing, prediction, persistence, and HTTP are separate.
+# DRY: share stable rules (finite_number, Probability), not merely similar-looking
+# code. Validation at both an HTTP boundary and a reusable domain boundary is
+# intentional: non-HTTP callers also need domain invariants.
+# SOLID basics applied to this example:
+# S - Single responsibility: models score, sinks record, routes handle HTTP.
+# O - Open/closed: introduce a new ScoringModel or sink without editing the service.
+# L - Liskov substitution: every ScoringModel must preserve score's input/output
+#     promises; do not return None or silently change the meaning of scores.
+# I - Interface segregation: Predictor and PredictionSink expose only what each
+#     consumer needs, instead of one large train/save/serve interface.
+# D - Dependency inversion: the route depends on Predictor, and PredictionService
+#     on ScoringModel/PredictionSink abstractions. Injection supplies concrete ones.
+# Modularization when this learning file grows into an application:
+#   domain.py        -> Prediction, ModelConfig, ScoringModel, PredictionSink
+#   services.py      -> PredictionService (imports domain, never routes)
+#   adapters.py      -> model/storage implementations (imports domain)
+#   schemas.py       -> Pydantic request/response models, normally module-level
+#   settings.py      -> environment parsing and validated settings
+#   api.py           -> routes and dependency providers
+#   main.py          -> composition root, lifespan resource setup/cleanup
+#   tests/           -> pure unit tests and HTTP contract tests
+# Keep these in one file here so the lesson runs directly. Schema factories defer
+# optional imports; ordinary API projects should define schemas at module level
+# for better static analysis. Use a type checker in CI alongside runtime tests.
+# Pin tested dependency versions in your application's lockfile. This educational
+# API has no authentication or durable storage and is not a deployment template.
+
+
 @timed
 def demo():
     is_fast_enough = threshold_checker(50)
@@ -329,8 +551,11 @@ def demo():
         print("itertools:", parameter_pairs, first_three, all_ids)
         print("functools:", expensive_feature(12), round_to_three(3.14159), total_samples)
         demo_object_oriented_python()
+        demo_typing()
 
 
 if __name__ == "__main__":
     demo()
+    if "--pydantic" in sys.argv:
+        demo_pydantic()
 
