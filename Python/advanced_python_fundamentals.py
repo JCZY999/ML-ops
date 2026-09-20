@@ -8,6 +8,9 @@ Requires Python 3.10+. Core demos use the standard library. Optional API demo:
     python advanced_python_fundamentals.py --pydantic
     python -m uvicorn advanced_python_fundamentals:create_app --factory
 Run the uvicorn command from this file's directory, then visit /docs.
+Optional logging/configuration lesson:
+    python -m pip install 'pydantic-settings>=2,<3' 'PyYAML>=6,<7'
+    python advanced_python_fundamentals.py --operations
 """
 
 from abc import ABC, abstractmethod
@@ -21,6 +24,11 @@ from math import isfinite
 from time import perf_counter
 import os
 import sys
+import json
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Annotated, Generic, Literal, Optional, Protocol, TypeVar, TypedDict, Union
 
 
@@ -535,6 +543,238 @@ def demo_typing() -> None:
 # API has no authentication or durable storage and is not a deployment template.
 
 
+# Logging, exceptions, and layered configuration
+# References: https://docs.python.org/3/howto/logging.html
+# https://docs.pydantic.dev/latest/concepts/pydantic_settings/
+# https://pyyaml.org/wiki/PyYAMLDocumentation
+
+
+class ApplicationError(Exception):
+    """Base for expected application failures; do not catch BaseException."""
+
+
+class ConfigurationError(ApplicationError):
+    """Configuration cannot be read or violates the application's schema."""
+
+
+# Custom exceptions let callers recover by meaning rather than parsing messages.
+# `raise ... from exc` retains the cause for debugging. Catch specific failures at
+# the boundary that can handle them; do not silently return defaults after errors.
+
+
+class JsonEventFormatter(logging.Formatter):
+    """One JSON object per record, with a small allowlist of contextual fields."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        event = {
+            "timestamp": datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "event": record.getMessage(),
+        }
+        # These fields must contain approved, nonsensitive values. An allowlist is
+        # not automatic redaction: never put a token in event or request_id either.
+        for key in ("request_id", "error_code"):
+            value = getattr(record, key, None)
+            if isinstance(value, str):
+                event[key] = value
+        if record.exc_info:
+            # Exception messages/tracebacks may contain credentials or payloads.
+            # Deliberately emit only the type; full traces belong in a protected
+            # diagnostic channel with an explicit redaction/access policy.
+            event["exception_type"] = record.exc_info[0].__name__
+        return json.dumps(event, ensure_ascii=True, allow_nan=False)
+
+
+def configure_event_logging(level: str = "INFO", stream=None) -> logging.Logger:
+    """Configure only this application's logger, at startup, not per request."""
+    levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+    if level not in levels:
+        raise ConfigurationError("Unsupported logging level")
+    logger = logging.getLogger("advanced_python.operations")
+    logger.setLevel(level)
+    logger.propagate = False  # Prevent a second copy through root handlers.
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(JsonEventFormatter())
+    logger.addHandler(handler)
+    return logger
+
+
+# Levels (in increasing severity):
+# DEBUG: detailed diagnostics, normally disabled in production.
+# INFO: expected milestones, such as configuration_loaded.
+# WARNING: recoverable degradation, such as a fallback being used.
+# ERROR: an operation failed; the process may still serve other requests.
+# CRITICAL: the application cannot continue, such as failed startup.
+# A logger set to INFO suppresses DEBUG. Handlers can also filter levels.
+# Libraries obtain logging.getLogger(__name__); the executable owns handlers.
+# Use logger.info("processed %s records", count) for lazy interpolation. Structured
+# events use stable names plus extra fields so collectors can search/aggregate.
+# logger.exception(...) is ERROR with exc_info=True; use it inside an except block.
+
+
+def read_config_file(path: Path) -> dict[str, object]:
+    """Read a small, trusted operator-supplied JSON or YAML configuration file."""
+    suffix = path.suffix.lower()
+    if suffix not in {".json", ".yaml", ".yml"}:
+        raise ConfigurationError("Configuration must use .json, .yaml, or .yml")
+    try:
+        # Bound the read before decoding. Safe YAML loading prevents Python object
+        # construction, but does not make arbitrary hostile input resource-safe.
+        with path.open("rb") as source:
+            raw = source.read(65_537)
+        if len(raw) > 65_536:
+            raise ConfigurationError("Configuration exceeds 64 KiB")
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ConfigurationError("Cannot read UTF-8 configuration") from exc
+    if suffix == ".json":
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise ConfigurationError("Invalid JSON configuration") from exc
+    else:
+        import yaml
+
+        try:
+            data = yaml.safe_load(text)  # Never yaml.load with an unsafe loader.
+        except yaml.YAMLError as exc:
+            raise ConfigurationError("Invalid YAML configuration") from exc
+    if not isinstance(data, dict) or any(not isinstance(key, str) for key in data):
+        raise ConfigurationError("Configuration must be a mapping with string keys")
+    if "api_token" in data:
+        raise ConfigurationError("Supply api_token through environment or secret files")
+    return data
+
+
+def build_settings_model(file_values: Mapping[str, object]):
+    """Create optional Pydantic v2 settings with explicit source precedence."""
+    from pydantic import Field, SecretStr, field_validator
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+
+    class ServiceSettings(BaseSettings):
+        model_config = SettingsConfigDict(
+            env_prefix="STUDY_", extra="forbid", frozen=True,
+            env_file_encoding="utf-8", hide_input_in_errors=True,
+        )
+        model_name: str = Field(default="mean-v1", min_length=1)
+        threshold: float = Field(default=0.7, ge=0, le=1, allow_inf_nan=False)
+        log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+        api_token: SecretStr  # Required: deliberately no embedded credential.
+
+        @field_validator("model_name")
+        @classmethod
+        def nonblank_name(cls, value: str) -> str:
+            if not value.strip():
+                raise ValueError("model_name must not be blank")
+            return value
+
+        @field_validator("api_token")
+        @classmethod
+        def nonblank_token(cls, value: SecretStr) -> SecretStr:
+            if not value.get_secret_value().strip():
+                raise ValueError("api_token must not be blank")
+            return value
+
+        @classmethod
+        def settings_customise_sources(
+            cls, settings_cls, init_settings, env_settings,
+            dotenv_settings, file_secret_settings,
+        ):
+            # Highest -> lowest priority. File data is a separate source, NOT
+            # constructor kwargs, so environment values can override the file.
+            return (
+                init_settings, env_settings, dotenv_settings,
+                file_secret_settings, lambda: dict(file_values),
+            )
+
+    return ServiceSettings
+
+
+def load_service_settings(
+    config_path: Optional[Path] = None, *,
+    dotenv_path: Optional[Path] = None, secrets_dir: Optional[Path] = None,
+):
+    """Resolve settings once at startup; never read .env implicitly on import."""
+    from pydantic import ValidationError
+    from pydantic_settings import SettingsError
+
+    for path in (dotenv_path,):
+        if path is not None and not path.is_file():
+            raise ConfigurationError("Explicit .env file does not exist")
+    if secrets_dir is not None and not secrets_dir.is_dir():
+        raise ConfigurationError("Explicit secrets directory does not exist")
+    values = read_config_file(config_path) if config_path is not None else {}
+    settings_type = build_settings_model(values)
+    try:
+        return settings_type(_env_file=dotenv_path, _secrets_dir=secrets_dir)
+    except (ValidationError, SettingsError, OSError, UnicodeError) as exc:
+        # Do not expose raw error dictionaries: they can contain sensitive input.
+        raise ConfigurationError("Service settings are missing or invalid") from exc
+
+
+# Configuration formats, representing the same non-secret values:
+# JSON: {"model_name": "mean-v1", "threshold": 0.8, "log_level": "INFO"}
+# YAML (indentation matters; quote strings that resemble booleans/dates):
+#   model_name: mean-v1
+#   threshold: 0.8
+#   log_level: INFO
+# JSON is strict and portable; YAML supports comments and is convenient for humans.
+# Both need schema validation AFTER parsing; neither should hold committed secrets.
+#
+# Environment variables are strings. Pydantic settings parses/validates them:
+# PowerShell: $env:STUDY_THRESHOLD = "0.9"
+# POSIX shell: export STUDY_THRESHOLD=0.9
+# .env is a local plaintext convenience, NOT encryption or automatic shell config:
+#   STUDY_THRESHOLD=0.85
+#   STUDY_API_TOKEN=<supply-a-local-development-token>
+# Pass dotenv_path=Path(".env") explicitly; existing environment values win.
+# Ignore .env and secret directories in Git; commit only a placeholder .env.example.
+# Mounted secret directory: a file named STUDY_API_TOKEN contains the token.
+# Precedence here: constructor overrides > environment > .env > secret files >
+# JSON/YAML > defaults. Unknown file/.env fields fail validation to catch typos.
+# SecretStr masks ordinary representations; it does NOT encrypt memory/storage.
+# Only call get_secret_value() at the external client boundary, never in logs.
+# Prefer a managed secret store or restricted mounted secrets in deployments;
+# rotate credentials, restrict access, and avoid dumping settings/environment.
+# In FastAPI, load settings during app creation/lifespan and inject them or a
+# configured client with Depends. Own client cleanup in lifespan. Cached settings
+# do not automatically reload changed environment values or rotated credentials.
+
+
+def demo_operations() -> None:
+    """Exercise file formats, dotenv, secret files, validation, and JSON events."""
+    logger = configure_event_logging()
+    with TemporaryDirectory(prefix="python-settings-") as directory:
+        root = Path(directory)
+        config = root / "service.json"
+        config.write_text(json.dumps({"threshold": 0.75}), encoding="utf-8")
+        yaml_config = root / "service.yaml"
+        yaml_config.write_text("threshold: 0.75\n", encoding="utf-8")
+        dotenv = root / ".env"
+        dotenv.write_text("STUDY_LOG_LEVEL=INFO\n", encoding="utf-8")
+        secrets = root / "secrets"
+        secrets.mkdir()
+        # Only a fake demonstration value, never a real credential.
+        (secrets / "STUDY_API_TOKEN").write_text("demo-only-not-a-credential", encoding="utf-8")
+        settings = load_service_settings(config, dotenv_path=dotenv, secrets_dir=secrets)
+        assert read_config_file(config) == read_config_file(yaml_config)
+        logger = configure_event_logging(settings.log_level)
+        logger.debug("configuration_diagnostics_ready")
+        logger.info("configuration_loaded", extra={"request_id": "demo-1"})
+        logger.warning("demo_storage_is_ephemeral")
+        try:
+            read_config_file(root / "missing.json")
+        except ConfigurationError:
+            logger.exception("configuration_read_failed", extra={"error_code": "CONFIG_READ"})
+        # CRITICAL is reserved for a real inability to continue:
+        # logger.critical("startup_failed", extra={"error_code": "CONFIG_INVALID"})
+        print("Settings threshold:", settings.threshold)  # Explicit non-secret field.
+
+
 @timed
 def demo():
     is_fast_enough = threshold_checker(50)
@@ -558,4 +798,6 @@ if __name__ == "__main__":
     demo()
     if "--pydantic" in sys.argv:
         demo_pydantic()
+    if "--operations" in sys.argv:
+        demo_operations()
 
