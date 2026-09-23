@@ -8,6 +8,9 @@ Requires Python 3.10+. Core demos use the standard library. Optional API demo:
     python advanced_python_fundamentals.py --pydantic
     python -m uvicorn advanced_python_fundamentals:create_app --factory
 Run the uvicorn command from this file's directory, then visit /docs.
+Optional pytest lesson (fixtures, parameterization, mocks, unit/integration/API tests):
+    python -m pip install pytest fastapi "pydantic>=2,<3" httpx
+    python advanced_python_fundamentals.py --pytest
 Optional logging/configuration lesson:
     python -m pip install 'pydantic-settings>=2,<3' 'PyYAML>=6,<7'
     python advanced_python_fundamentals.py --operations
@@ -794,10 +797,243 @@ def demo():
         demo_typing()
 
 
+# Pytest tutorial: executable examples for the application above.
+# Install: python -m pip install pytest fastapi 'pydantic>=2,<3' httpx
+# Run from this file's directory:
+#   python advanced_python_fundamentals.py --pytest
+#   python advanced_python_fundamentals.py --pytest -k unit -v
+#   python advanced_python_fundamentals.py --pytest -k api --maxfail=1
+# The runner writes this test module to a temporary directory. Keeping its source
+# here makes the lesson self-contained without making pytest a core dependency.
+# In a real project, move the string's contents into tests/test_predictions.py;
+# place fixtures shared by several test modules in tests/conftest.py. Pytest finds
+# test_*.py / *_test.py files and test_* functions; don't call fixtures yourself.
+# References:
+# https://docs.pytest.org/en/stable/how-to/fixtures.html
+# https://docs.pytest.org/en/stable/how-to/parametrize.html
+# https://docs.python.org/3/library/unittest.mock.html
+# https://fastapi.tiangolo.com/tutorial/testing/
+PYTEST_TUTORIAL = r'''
+import os
+from unittest.mock import Mock
+
+import pytest
+import advanced_python_fundamentals as lesson
+
+
+# Fixtures: pytest injects values by argument name. Fixtures can depend on other
+# fixtures. Function scope (the default) gives every test fresh mutable state.
+# Other scopes: class, module, package, session. Broader scopes reuse resources,
+# so avoid sharing mutable data. A broad fixture cannot request a narrower one.
+# Prefer explicit fixture arguments over autouse=True when dependencies matter.
+@pytest.fixture
+def config():
+    return lesson.ModelConfig("test-model", threshold=0.7)
+
+
+@pytest.fixture
+def sink():
+    return lesson.InMemoryPredictionSink()
+
+
+@pytest.fixture
+def service(config, sink):
+    return lesson.PredictionService(config, lesson.MeanProbabilityModel(config), sink)
+
+
+# 1. Parameterized tests run once per case; ids give readable failure reports.
+# Each expected value is a behavioral example, not a copy of implementation code.
+@pytest.mark.parametrize("raw,expected", [
+    pytest.param("  run-1  ", "run-1", id="trim-whitespace"),
+    pytest.param(0, "0", id="zero-is-valid"),
+    pytest.param(42, "42", id="integer-id"),
+])
+def test_unit_normalize_id(raw, expected):
+    assert lesson.normalize_run_id(raw) == expected
+
+
+# A parameterized fixture reruns EVERY dependent test for each fixture value.
+@pytest.fixture(params=[0.0, 1.0], ids=["minimum-threshold", "maximum-threshold"])
+def boundary_config(request):
+    return lesson.ModelConfig("boundary-model", request.param)
+
+
+def test_unit_threshold_endpoints(boundary_config):
+    assert boundary_config.threshold in (0.0, 1.0)
+
+
+# 2. Mocking replaces a collaborator, not the behavior being tested. spec_set
+# rejects unknown attributes; side_effect simulates failures. Mock is from the
+# standard library, so pytest-mock is not needed. For patch(), patch the name
+# WHERE THE CODE UNDER TEST LOOKS IT UP, not necessarily where it was defined.
+def test_unit_service_with_mock_model(config, sink):
+    model = Mock(spec_set=lesson.ScoringModel)
+    model.score.return_value = 0.9
+    service = lesson.PredictionService(config, model, sink)
+    result = service.predict((0.2, 0.4))
+    assert result == lesson.Prediction("test-model", 0.9, True)
+    model.score.assert_called_once_with((0.2, 0.4))
+    assert sink.records == (result,)
+
+
+def test_unit_storage_failure_propagates(config):
+    sink = Mock(spec_set=lesson.InMemoryPredictionSink)
+    sink.write.side_effect = OSError("demo disk unavailable")
+    service = lesson.PredictionService(config, lesson.MeanProbabilityModel(config), sink)
+    with pytest.raises(OSError, match="demo disk unavailable"):
+        service.predict((0.8,))
+    sink.write.assert_called_once()
+
+
+# Built-in monkeypatch restores environment changes after the test, even on
+# failure. This tests explicit environment parsing without editing real .env files.
+def test_unit_environment_configuration(monkeypatch):
+    monkeypatch.setenv("ML_MODEL_NAME", "isolated-model")
+    monkeypatch.setenv("ML_THRESHOLD", "0.8")
+    config = lesson.load_model_config(dict(os.environ))
+    assert config == lesson.ModelConfig("isolated-model", 0.8)
+
+
+# 3. Unit tests isolate a small contract. Arrange -> Act -> Assert makes intent
+# visible. Use approx for floating-point calculations, not arbitrary rounding.
+def test_unit_mean_score(config):
+    model = lesson.MeanProbabilityModel(config)  # Arrange
+    score = model.score((0.6, 0.8))              # Act
+    assert score == pytest.approx(0.7)          # Assert
+
+
+def test_unit_absent_index_is_not_zero():
+    assert lesson.find_run_index(["run-a"], "run-a") == 0
+    assert lesson.find_run_index(["run-a"], "missing") is None
+
+
+# 4. Integration tests wire real components together. No model/sink mocks here.
+# Unit vs integration describes the boundary, not a pytest-specific test type.
+def test_integration_prediction_is_recorded(service, sink):
+    result = service.predict((0.8, 0.9))
+    assert result.score == pytest.approx(0.85)
+    assert result.label is True
+    assert sink.records == (result,)
+
+
+# tmp_path is a per-test pathlib.Path. This exercises real file I/O + JSON
+# parsing + configuration validation, entirely in a temporary directory.
+def test_integration_config_file(tmp_path):
+    path = tmp_path / "model.json"
+    path.write_text('{"model_name":"file-model","threshold":0.8}', encoding="utf-8")
+    config = lesson.ModelConfig.from_mapping(lesson.read_config_file(path))
+    assert config == lesson.ModelConfig("file-model", 0.8)
+
+
+# 5. API tests verify HTTP status + response + side effects. TestClient runs the
+# ASGI app in process, without a server or external network. This is not a deployed
+# end-to-end test of DNS, TLS, proxies, authentication, or a production database.
+@pytest.fixture
+def client(service):
+    # Skip only API tests if optional dependencies are missing; unit tests run.
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+    app = lesson.create_app(service_factory=lambda: service)
+    # yield separates setup from cleanup. Context exit closes the client and runs
+    # lifespan shutdown even if the test fails. Protect acquired resources with
+    # context managers/finally: code after yield won't run if setup never yields.
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+def test_api_prediction(client, sink):
+    response = client.post("/predict", json={"features": [0.8, 0.9], "request_id": "req-1"})
+    assert response.status_code == 200
+    assert response.json() == {
+        "model_name": "test-model", "score": pytest.approx(0.85),
+        "label": True, "request_id": "req-1",
+    }
+    assert len(sink.records) == 1
+
+
+@pytest.mark.parametrize("payload", [
+    {}, {"features": []}, {"features": ["0.8"]},
+    {"features": [True]}, {"features": [1.1]},
+    {"features": [0.8], "unknown": 1}, {"features": [0.5] * 1025},
+], ids=["missing", "empty", "string", "boolean", "out-of-range", "extra-field", "too-many"])
+def test_api_invalid_input(client, sink, payload):
+    response = client.post("/predict", json=payload)
+    assert response.status_code == 422
+    assert response.json()["detail"]
+    assert sink.records == ()  # Validation must not record a prediction.
+
+
+def test_api_storage_failure(client, sink, monkeypatch):
+    failing_write = Mock(side_effect=OSError("private infrastructure detail"))
+    monkeypatch.setattr(sink, "write", failing_write)
+    response = client.post("/predict", json={"features": [0.8]})
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Prediction storage unavailable"}
+    failing_write.assert_called_once()
+
+
+# 6. Edge cases target contract boundaries: empty input, inclusive thresholds,
+# invalid types (bool is an int subclass!), NaN/infinity, and missing files.
+@pytest.mark.parametrize("value,error", [
+    (True, TypeError), ("0.5", TypeError), (None, TypeError),
+    (float("nan"), ValueError), (float("inf"), ValueError),
+    (-0.01, ValueError), (1.01, ValueError),
+])
+def test_edge_invalid_threshold(value, error):
+    with pytest.raises(error):
+        lesson.ModelConfig("bad-config", value)
+
+
+def test_edge_empty_features(service, sink):
+    with pytest.raises(ValueError, match="At least one feature"):
+        service.predict(())
+    assert sink.records == ()
+
+
+def test_edge_exact_threshold_is_positive(service):
+    assert service.predict((0.7,)).label is True
+
+
+def test_edge_missing_config_preserves_cause(tmp_path):
+    with pytest.raises(lesson.ConfigurationError, match="Cannot read UTF-8") as caught:
+        lesson.read_config_file(tmp_path / "missing.json")
+    assert isinstance(caught.value.__cause__, FileNotFoundError)
+
+
+# Avoid test-order dependencies, sleeps, real credentials, and external services.
+# Assert observable behavior; don't mock every internal call. Use -k to select
+# names here. For larger suites, register unit/integration/api markers in
+# pytest.ini or pyproject.toml and select with -m. Skips are not passing coverage:
+# install API dependencies in CI to exercise the HTTP tests too.
+'''
+
+
+def run_pytest_tutorial(arguments: list[str]) -> int:
+    """Run the embedded test module in a fresh process; preserve pytest's exit code."""
+    import subprocess
+
+    with TemporaryDirectory(prefix="python-pytest-") as directory:
+        tests = Path(directory) / "test_predictions.py"
+        tests.write_text(PYTEST_TUTORIAL, encoding="utf-8")
+        environment = dict(os.environ)
+        module_directory = str(Path(__file__).resolve().parent)
+        environment["PYTHONPATH"] = os.pathsep.join(
+            filter(None, (module_directory, environment.get("PYTHONPATH")))
+        )
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", str(tests), "-q",
+             "-p", "no:cacheprovider", *arguments],
+            env=environment, check=False,
+        ).returncode
+
+
+
 if __name__ == "__main__":
+    if "--pytest" in sys.argv:
+        raise SystemExit(run_pytest_tutorial(sys.argv[sys.argv.index("--pytest") + 1:]))
     demo()
     if "--pydantic" in sys.argv:
         demo_pydantic()
     if "--operations" in sys.argv:
         demo_operations()
-
