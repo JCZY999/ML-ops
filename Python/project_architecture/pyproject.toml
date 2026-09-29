@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ml-architecture-lesson"
+version = "0.1.0"
+description = "Day 6: a small, testable ML project with a src layout"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["scikit-learn>=1.5,<2", "numpy>=1.26,<3", "joblib>=1.4,<2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "build>=1.2,<2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"

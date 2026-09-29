@@ -47,9 +47,9 @@ Along the way, we will learn to connect model quality with software quality, ope
 
 ## Start learning
 
-**Current status: the Python foundation lesson is available. The broader MLOps curriculum below is the planned course direction; later modules and the capstone have not been implemented yet.** Tools and lesson boundaries may evolve as the course grows.
+**Current status: the Python foundation and Day 6 project architecture lessons are available. The broader MLOps curriculum below is the planned course direction; later modules and the capstone have not been implemented yet.** Tools and lesson boundaries may evolve as the course grows.
 
-Start with [Advanced Python Fundamentals](Python/advanced_python_fundamentals.py). It combines explanations and executable examples in one file.
+Start with [Advanced Python Fundamentals](Python/advanced_python_fundamentals.py). It combines explanations and executable examples in one file. Then continue with [Day 6 — Python project architecture](Python/project_architecture/README.md), a runnable packaged ML example covering modules, virtual environments, dependencies, tests and Git.
 
 | Available lesson area | What you will practice |
 | --- | --- |
@@ -69,7 +69,7 @@ The prediction example uses a simple mean of probability features to keep the en
 | Stage | The question | Topics we will cover | Practical outcome | Status |
 | --- | --- | --- | --- | --- |
 | 01 · Python for ML systems | Can someone else understand and extend this code? | Advanced Python, typing, OOP, interfaces, clean design, exceptions, logging, configuration, and secrets | A readable, configurable prediction application | Available foundation |
-| 02 · Engineering workflow | Can a teammate run and change it confidently? | Git, project structure, virtual environments, dependency locking, packaging, unit and integration tests, linting, and type checks | A reproducible project with automated checks | Planned |
+| 02 · Engineering workflow | Can a teammate run and change it confidently? | Git, project structure, virtual environments, dependency locking, packaging, unit and integration tests, linting, and type checks | A reproducible project with automated checks | [Project architecture lesson available](Python/project_architecture/README.md); locking, linting and type-check automation planned |
 | 03 · Data foundations | Can we trust the inputs? | SQL, ingestion, schemas, data quality, missing values, leakage, train/validation/test splits, and data versioning | A validated dataset with traceable origins | Planned |
 | 04 · Reproducible modeling | Can we explain why this model won? | Baselines, preprocessing, feature engineering, metrics, cross-validation, tuning, random seeds, and error analysis | A repeatable training and evaluation workflow | Planned |
 | 05 · Experiment and model management | Which run produced this artifact? | Experiment tracking, parameters, metrics, artifacts, lineage, model registries, and promotion criteria | A traceable candidate ready for review | Planned |
@@ -181,7 +181,9 @@ The intended deliverables are a reproducible training workflow, tracked artifact
 ML-ops/
 ├── README.md
 └── Python/
-    └── advanced_python_fundamentals.py
+    ├── README.md
+    ├── advanced_python_fundamentals.py
+    └── project_architecture/  # Day 6: src/, tests/, configs/, scripts/, pyproject.toml
 ```
 
 New course modules will be linked here as they become available.

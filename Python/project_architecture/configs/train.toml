@@ -1,0 +1,5 @@
+# Paths are relative to this configuration file, not the shell's directory.
+seed = 42
+test_size = 0.2
+regularization_c = 1.0
+output_dir = "../artifacts"
