@@ -11,6 +11,8 @@ Run the uvicorn command from this file's directory, then visit /docs.
 Optional pytest lesson (fixtures, parameterization, mocks, unit/integration/API tests):
     python -m pip install pytest fastapi "pydantic>=2,<3" httpx
     python advanced_python_fundamentals.py --pytest
+Logging, exceptions and packaging (standard library):
+    python advanced_python_fundamentals.py --packaging
 Optional logging/configuration lesson:
     python -m pip install 'pydantic-settings>=2,<3' 'PyYAML>=6,<7'
     python advanced_python_fundamentals.py --operations
@@ -778,6 +780,145 @@ def demo_operations() -> None:
         print("Settings threshold:", settings.threshold)  # Explicit non-secret field.
 
 
+# Logging, exceptions and packaging
+# Build on the JSON logger and ApplicationError hierarchy above.
+# References:
+# https://docs.python.org/3/tutorial/errors.html
+# https://packaging.python.org/en/latest/guides/writing-pyproject-toml/
+# https://docs.astral.sh/ruff/configuration/
+
+
+class ArtifactError(ApplicationError):
+    """A model artifact cannot be loaded or has an invalid schema."""
+
+
+def load_artifact_metadata(path: Path) -> ModelConfig:
+    """Translate low-level failures into one meaningful application contract."""
+    try:
+        values = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ArtifactError("Cannot read model artifact metadata") from exc
+    if not isinstance(values, dict):
+        raise ArtifactError("Artifact metadata must be a JSON object")
+    try:
+        return ModelConfig.from_mapping(values)
+    except (TypeError, ValueError) as exc:
+        raise ArtifactError("Invalid model artifact metadata") from exc
+
+
+# Catch only failures you can handle. Do not catch BaseException: interrupts and
+# process exits should propagate. Avoid bare except/pass and returning fake success.
+# try/except/else/finally: handle failure / run on success / always clean up.
+# Prefer with for resources; never return in finally (it can suppress exceptions).
+# Translate errors near an abstraction boundary, then log once where handled.
+# Chaining preserves the diagnostic cause; callers catch ArtifactError by meaning.
+
+
+# Copy this example into Python/pyproject.toml to package this single module.
+# It is lesson data, not an active repository-wide build configuration.
+# Distribution name uses hyphens; Python imports use the module's underscores.
+# Build dependencies belong to build-system; runtime dependencies to project.
+# Core lessons need only the standard library, so dependencies is empty.
+PYPROJECT_TUTORIAL = r'''
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "advanced-python-fundamentals"
+version = "0.1.0"
+description = "Practical Python fundamentals for MLOps"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+api = ["fastapi>=0.115,<1", "pydantic>=2,<3", "uvicorn>=0.30,<1"]
+operations = ["pydantic-settings>=2,<3", "PyYAML>=6,<7"]
+dev = ["pytest>=8,<9", "httpx>=0.27,<1", "ruff>=0.9,<1", "build>=1,<2"]
+
+[tool.setuptools]
+py-modules = ["advanced_python_fundamentals"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+include = ["advanced_python_fundamentals.py", "pyproject.toml"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+'''
+
+
+# Dependency management (run from Python/ after saving the TOML example):
+#   python -m venv .venv
+# Activate in PowerShell: .\.venv\Scripts\Activate.ps1
+# Activate in POSIX shell: source .venv/bin/activate
+#   python -m pip install --upgrade pip
+#   python -m pip install -e ".[api,operations,dev]"
+# -e is editable development installation; changes to source are immediately used.
+# Extras install optional features; they do not enable flags or run code.
+# Keep .venv/, build/, dist/, and *.egg-info/ out of Git.
+# Constraints express compatibility, not a fully reproducible environment.
+# For a deployed application, resolve and commit a lock file with your chosen
+# manager (e.g. uv lock, then uv sync --locked --extra api --extra operations
+# --extra dev). Keep the Python version/platform and selected extras consistent.
+# With pip, python -m pip freeze > requirements.lock.txt snapshots a CLEAN venv;
+# python -m pip install -r requirements.lock.txt reuses its versions. This snapshot
+# is not a portable, hash-verified lock; do not copy it into library dependencies.
+# Update dependencies deliberately and rerun tests; never commit index credentials.
+
+
+# Linting finds suspicious code/imports; formatting normalizes code layout.
+# Ruff provides both, but formatting does not prove correctness or replace tests.
+#   python -m ruff check advanced_python_fundamentals.py
+#   python -m ruff check --fix advanced_python_fundamentals.py
+#   python -m ruff format advanced_python_fundamentals.py
+# Review fixes. The existing teaching file may need import sorting/formatting.
+# CI checks (fail without rewriting source):
+#   python -m ruff check advanced_python_fundamentals.py
+#   python -m ruff format --check advanced_python_fundamentals.py
+#   python advanced_python_fundamentals.py --pytest
+# Ruff does not lint Python embedded in tutorial strings; test those separately.
+# Build a source distribution + wheel without publishing:
+#   python -m build
+# Verify the wheel in a fresh venv: python -m pip install dist/<wheel-name>.whl
+# Then, outside the source directory: python -m advanced_python_fundamentals
+# Editable installs can hide packaging omissions; test the built wheel too.
+# For a larger project, use src/<package>/ with __init__.py and tests/ instead of
+# a single module, and update backend discovery. pyproject.toml is declarative:
+# importing this file neither installs dependencies nor creates project files.
+
+
+def demo_logging_exceptions_packaging() -> None:
+    """Run standard-library-only success/failure examples and show the TOML."""
+    logger = configure_event_logging()
+    with TemporaryDirectory(prefix="python-artifact-") as directory:
+        root = Path(directory)
+        artifact = root / "model.json"
+        artifact.write_text(
+            json.dumps({"model_name": "packaged-model", "threshold": 0.8}),
+            encoding="utf-8",
+        )
+        try:
+            config = load_artifact_metadata(artifact)
+        except ArtifactError:
+            logger.exception("artifact_load_failed", extra={"error_code": "ARTIFACT"})
+        else:
+            logger.info("artifact_loaded", extra={"request_id": "packaging-demo"})
+            print("Artifact config:", config)
+        try:
+            load_artifact_metadata(root / "missing.json")
+        except ArtifactError as exc:
+            logger.exception("artifact_load_failed", extra={"error_code": "ARTIFACT"})
+            print("Preserved cause:", type(exc.__cause__).__name__)
+    print("\nExample pyproject.toml (save manually in Python/):")
+    print(PYPROJECT_TUTORIAL)
+
+
 @timed
 def demo():
     is_fast_enough = threshold_checker(50)
@@ -1037,3 +1178,5 @@ if __name__ == "__main__":
         demo_pydantic()
     if "--operations" in sys.argv:
         demo_operations()
+    if "--packaging" in sys.argv:
+        demo_logging_exceptions_packaging()
